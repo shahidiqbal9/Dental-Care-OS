@@ -1,404 +1,83 @@
--- DentalCare OS: multi-clinic foundation
--- Apply once in Supabase SQL Editor or with Supabase CLI.
--- Never expose service_role keys in browser code.
-
-create extension if not exists pgcrypto;
-
-create type public.org_role as enum ('owner', 'org_admin');
-create type public.clinic_role as enum ('clinic_admin', 'doctor', 'receptionist');
-create type public.patient_status as enum ('active', 'inactive', 'archived');
-create type public.appointment_status as enum ('scheduled', 'confirmed', 'completed', 'cancelled', 'no_show');
-create type public.followup_status as enum ('pending', 'completed', 'cancelled');
-
-create table public.organizations (
-  id uuid primary key default gen_random_uuid(),
-  name text not null check (char_length(trim(name)) between 2 and 120),
-  created_by uuid not null references auth.users(id) on delete restrict,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-create table public.organization_members (
-  organization_id uuid not null references public.organizations(id) on delete cascade,
-  user_id uuid not null references auth.users(id) on delete cascade,
-  role public.org_role not null default 'org_admin',
-  created_at timestamptz not null default now(),
-  primary key (organization_id, user_id)
-);
-
-create table public.clinics (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null references public.organizations(id) on delete cascade,
-  name text not null check (char_length(trim(name)) between 2 and 120),
-  timezone text not null default 'Asia/Karachi',
-  phone text,
-  email text,
-  address text,
-  is_active boolean not null default true,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  unique (id, organization_id)
-);
-
-create table public.clinic_members (
-  clinic_id uuid not null,
-  organization_id uuid not null,
-  user_id uuid not null references auth.users(id) on delete cascade,
-  role public.clinic_role not null,
-  created_at timestamptz not null default now(),
-  primary key (clinic_id, user_id),
-  foreign key (clinic_id, organization_id)
-    references public.clinics(id, organization_id) on delete cascade
-);
-
-create table public.patients (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null,
-  clinic_id uuid not null,
-  patient_number bigint generated always as identity,
-  first_name text not null check (char_length(trim(first_name)) between 1 and 80),
-  last_name text,
-  phone text,
-  email text,
-  date_of_birth date,
-  sex text check (sex is null or sex in ('female','male','other','prefer_not_to_say')),
-  notes text,
-  status public.patient_status not null default 'active',
-  created_by uuid not null default auth.uid() references auth.users(id),
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  deleted_at timestamptz,
-  foreign key (clinic_id, organization_id)
-    references public.clinics(id, organization_id) on delete restrict,
-  unique (clinic_id, patient_number),
-  unique (id, clinic_id, organization_id)
-);
-
-create table public.procedures (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null,
-  clinic_id uuid not null,
-  patient_id uuid not null,
-  doctor_id uuid references auth.users(id) on delete set null,
-  procedure_name text not null check (char_length(trim(procedure_name)) between 2 and 160),
-  tooth_number text,
-  description text,
-  performed_at timestamptz not null default now(),
-  fee numeric(12,2) check (fee is null or fee >= 0),
-  created_by uuid not null default auth.uid() references auth.users(id),
-  created_at timestamptz not null default now(),
-  foreign key (clinic_id, organization_id)
-    references public.clinics(id, organization_id) on delete restrict,
-  foreign key (patient_id, clinic_id, organization_id)
-    references public.patients(id, clinic_id, organization_id) on delete restrict
-);
-
-create table public.appointments (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null,
-  clinic_id uuid not null,
-  patient_id uuid not null,
-  doctor_id uuid references auth.users(id) on delete set null,
-  starts_at timestamptz not null,
-  ends_at timestamptz not null,
-  status public.appointment_status not null default 'scheduled',
-  reason text,
-  internal_notes text,
-  created_by uuid not null default auth.uid() references auth.users(id),
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  check (ends_at > starts_at),
-  foreign key (clinic_id, organization_id)
-    references public.clinics(id, organization_id) on delete restrict,
-  foreign key (patient_id, clinic_id, organization_id)
-    references public.patients(id, clinic_id, organization_id) on delete restrict
-);
-
-create table public.followups (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null,
-  clinic_id uuid not null,
-  patient_id uuid not null,
-  procedure_id uuid references public.procedures(id) on delete set null,
-  assigned_to uuid references auth.users(id) on delete set null,
-  due_at timestamptz not null,
-  status public.followup_status not null default 'pending',
-  note text,
-  completed_at timestamptz,
-  created_by uuid not null default auth.uid() references auth.users(id),
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  foreign key (clinic_id, organization_id)
-    references public.clinics(id, organization_id) on delete restrict,
-  foreign key (patient_id, clinic_id, organization_id)
-    references public.patients(id, clinic_id, organization_id) on delete restrict
-);
-
--- Queue is written by trusted server-side functions, not directly by browsers.
-create table public.notification_jobs (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null,
-  clinic_id uuid not null,
-  followup_id uuid references public.followups(id) on delete cascade,
-  channel text not null check (channel in ('email','whatsapp')),
-  recipient text not null,
-  payload jsonb not null default '{}'::jsonb,
-  scheduled_for timestamptz not null,
-  sent_at timestamptz,
-  attempts integer not null default 0 check (attempts >= 0),
-  last_error text,
-  created_at timestamptz not null default now(),
-  foreign key (clinic_id, organization_id)
-    references public.clinics(id, organization_id) on delete cascade
-);
-
-create table public.audit_logs (
-  id bigint generated always as identity primary key,
-  organization_id uuid not null references public.organizations(id) on delete cascade,
-  clinic_id uuid references public.clinics(id) on delete set null,
-  actor_id uuid references auth.users(id) on delete set null,
-  action text not null,
-  entity_type text not null,
-  entity_id uuid,
-  created_at timestamptz not null default now()
-);
-
-create index patients_clinic_name_idx on public.patients (clinic_id, last_name, first_name) where deleted_at is null;
-create index appointments_clinic_starts_idx on public.appointments (clinic_id, starts_at);
-create index followups_due_idx on public.followups (clinic_id, due_at) where status = 'pending';
-create index notification_jobs_due_idx on public.notification_jobs (scheduled_for) where sent_at is null;
-
--- Authorization helpers are SECURITY DEFINER to avoid RLS recursion.
-create or replace function public.is_org_member(p_org_id uuid)
-returns boolean
-language sql stable security definer
-set search_path = ''
-as $$
-  select exists (
-    select 1 from public.organization_members m
-    where m.organization_id = p_org_id and m.user_id = (select auth.uid())
-  );
-$$;
-
-create or replace function public.has_org_role(p_org_id uuid, p_roles public.org_role[])
-returns boolean
-language sql stable security definer
-set search_path = ''
-as $$
-  select exists (
-    select 1 from public.organization_members m
-    where m.organization_id = p_org_id
-      and m.user_id = (select auth.uid())
-      and m.role = any(p_roles)
-  );
-$$;
-
-create or replace function public.has_clinic_role(p_clinic_id uuid, p_roles public.clinic_role[] default null)
-returns boolean
-language sql stable security definer
-set search_path = ''
-as $$
-  select exists (
-    select 1
-    from public.clinic_members cm
-    where cm.clinic_id = p_clinic_id
-      and cm.user_id = (select auth.uid())
-      and (p_roles is null or cm.role = any(p_roles))
-  );
-$$;
-
-create or replace function public.can_access_clinic(p_clinic_id uuid, p_org_id uuid)
-returns boolean
-language sql stable security definer
-set search_path = ''
-as $$
-  select public.is_org_member(p_org_id)
-     and exists (
-       select 1 from public.clinics c
-       where c.id = p_clinic_id and c.organization_id = p_org_id
-     )
-     and (
-       public.has_org_role(p_org_id, array['owner','org_admin']::public.org_role[])
-       or public.has_clinic_role(p_clinic_id)
-     );
-$$;
-
-create or replace function public.set_updated_at()
-returns trigger language plpgsql
-set search_path = ''
-as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$;
-
-create trigger organizations_updated_at before update on public.organizations
-for each row execute function public.set_updated_at();
-create trigger clinics_updated_at before update on public.clinics
-for each row execute function public.set_updated_at();
-create trigger patients_updated_at before update on public.patients
-for each row execute function public.set_updated_at();
-create trigger appointments_updated_at before update on public.appointments
-for each row execute function public.set_updated_at();
-create trigger followups_updated_at before update on public.followups
-for each row execute function public.set_updated_at();
-
--- RLS on every tenant-bearing table.
-alter table public.organizations enable row level security;
-alter table public.organization_members enable row level security;
-alter table public.clinics enable row level security;
-alter table public.clinic_members enable row level security;
-alter table public.patients enable row level security;
-alter table public.procedures enable row level security;
-alter table public.appointments enable row level security;
-alter table public.followups enable row level security;
-alter table public.notification_jobs enable row level security;
-alter table public.audit_logs enable row level security;
-
-create policy "org members read organization"
-on public.organizations for select
-using (public.is_org_member(id));
-
-create policy "authenticated users create organization"
-on public.organizations for insert to authenticated
-with check (created_by = (select auth.uid()));
-
-create policy "org owners update organization"
-on public.organizations for update to authenticated
-using (public.has_org_role(id, array['owner']::public.org_role[]))
-with check (public.has_org_role(id, array['owner']::public.org_role[]));
-
-create policy "members read own org memberships"
-on public.organization_members for select
-using (user_id = (select auth.uid()) or public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[]));
--- Membership writes are deliberately unavailable to browser sessions. Use a
--- trusted Edge Function with service-role credentials for invitations/role changes.
-
-create policy "org members read clinics they can access"
-on public.clinics for select
-using (public.can_access_clinic(id, organization_id));
-
-create policy "org admins create clinics"
-on public.clinics for insert to authenticated
-with check (public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[]));
-
-create policy "org admins update clinics"
-on public.clinics for update to authenticated
-using (public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[]))
-with check (public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[]));
-
-create policy "clinic members read clinic memberships"
-on public.clinic_members for select
-using (
-  user_id = (select auth.uid())
-  or public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[])
-  or public.has_clinic_role(clinic_id, array['clinic_admin']::public.clinic_role[])
-);
--- Membership writes are deliberately unavailable to browser sessions. Use a
--- trusted Edge Function with service-role credentials for invitations/role changes.
-
-create policy "clinic staff read patients"
-on public.patients for select
-using (deleted_at is null and public.can_access_clinic(clinic_id, organization_id));
-
-create policy "clinic staff create patients"
-on public.patients for insert to authenticated
-with check (
-  created_by = (select auth.uid())
-  and public.can_access_clinic(clinic_id, organization_id)
-);
-
-create policy "clinic staff update patients"
-on public.patients for update to authenticated
-using (public.can_access_clinic(clinic_id, organization_id))
-with check (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "clinic staff read procedures"
-on public.procedures for select
-using (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "doctors and clinic admins create procedures"
-on public.procedures for insert to authenticated
-with check (
-  created_by = (select auth.uid())
-  and public.can_access_clinic(clinic_id, organization_id)
-  and (
-    public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[])
-    or public.has_clinic_role(clinic_id, array['doctor','clinic_admin']::public.clinic_role[])
-  )
-);
-
-create policy "doctors and clinic admins update procedures"
-on public.procedures for update to authenticated
-using (
-  public.can_access_clinic(clinic_id, organization_id)
-  and (
-    public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[])
-    or public.has_clinic_role(clinic_id, array['doctor','clinic_admin']::public.clinic_role[])
-  )
-)
-with check (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "clinic staff read appointments"
-on public.appointments for select
-using (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "clinic staff create appointments"
-on public.appointments for insert to authenticated
-with check (
-  created_by = (select auth.uid())
-  and public.can_access_clinic(clinic_id, organization_id)
-);
-
-create policy "clinic staff update appointments"
-on public.appointments for update to authenticated
-using (public.can_access_clinic(clinic_id, organization_id))
-with check (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "clinic staff read followups"
-on public.followups for select
-using (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "clinic staff create followups"
-on public.followups for insert to authenticated
-with check (
-  created_by = (select auth.uid())
-  and public.can_access_clinic(clinic_id, organization_id)
-);
-
-create policy "clinic staff update followups"
-on public.followups for update to authenticated
-using (public.can_access_clinic(clinic_id, organization_id))
-with check (public.can_access_clinic(clinic_id, organization_id));
-
--- Browser users can read their clinic's notification history, but only trusted
--- server-side code using the service role may insert/update queue jobs.
-create policy "clinic staff read notification jobs"
-on public.notification_jobs for select
-using (public.can_access_clinic(clinic_id, organization_id));
-
-create policy "org admins read audit logs"
-on public.audit_logs for select
-using (
-  public.has_org_role(organization_id, array['owner','org_admin']::public.org_role[])
-  or (clinic_id is not null and public.has_clinic_role(clinic_id, array['clinic_admin']::public.clinic_role[]))
-);
-
--- Do not grant anon access. Authenticated table access is constrained by RLS.
-grant usage on schema public to authenticated;
-grant select, insert, update on public.organizations to authenticated;
-grant select, insert, update on public.organization_members to authenticated;
-grant select, insert, update on public.clinics to authenticated;
-grant select, insert, update on public.clinic_members to authenticated;
-grant select, insert, update on public.patients to authenticated;
-grant select, insert, update on public.procedures to authenticated;
-grant select, insert, update on public.appointments to authenticated;
-grant select, insert, update on public.followups to authenticated;
-grant select on public.notification_jobs to authenticated;
-grant select on public.audit_logs to authenticated;
-
--- Important bootstrap note:
--- Organization creation + owner membership must be performed atomically by a
--- trusted RPC/Edge Function. Do not allow users to self-assign owner in a
--- browser insert. The next implementation step adds that secure RPC.
+/* Dental OS Care - receptionist + dentist clinic manager (no server, runs in browser) */
+const PINS={receptionist:'1111',dentist:'2222'}; // CHANGE THESE
+const PROCS={
+"Diagnosis":[["Consultation / Checkup",500],["IOPA X-ray",500],["OPG X-ray",2500],["CBCT Scan",6000]],
+"Preventive":[["Scaling & Polishing",3000],["Fluoride Application",1500],["Fissure Sealant",1500]],
+"Restorative":[["Composite Filling",3000],["GIC Filling",2000],["Amalgam Filling",2000],["Temporary Filling",1000],["Core Buildup",3000]],
+"Endodontics (RCT)":[["RCT Anterior",8000],["RCT Premolar",10000],["RCT Molar",15000],["Re-RCT",15000],["Pulpotomy",3000],["Pulpectomy",4000]],
+"Oral Surgery":[["Simple Extraction",2000],["Surgical Extraction",5000],["Wisdom Tooth Removal",8000],["Abscess Drainage",2000],["Apicectomy",12000],["Biopsy",5000]],
+"Prosthodontics":[["PFM Crown",12000],["Zirconia Crown",25000],["Bridge (per unit)",12000],["Complete Denture",30000],["Partial Denture",15000],["Veneer",25000],["Post & Core",5000]],
+"Implants":[["Implant Placement",80000],["Bone Graft",30000],["Sinus Lift",60000]],
+"Orthodontics":[["Metal Braces",80000],["Ceramic Braces",120000],["Clear Aligners",250000],["Retainer",10000],["Monthly Adjustment",3000]],
+"Gums (Perio)":[["Deep Cleaning (SRP)",5000],["Gingivectomy",5000],["Flap Surgery",10000]],
+"Cosmetic":[["Teeth Whitening",15000],["Smile Design",50000],["Gum Contouring",10000]],
+"Pediatric":[["Pulpotomy (Child)",3000],["Stainless Steel Crown",5000],["Space Maintainer",5000]]};
+const UP=[18,17,16,15,14,13,12,11,21,22,23,24,25,26,27,28],LO=[48,47,46,45,44,43,42,41,31,32,33,34,35,36,37,38];
+const $=s=>document.querySelector(s),h=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const today=()=>new Date().toISOString().slice(0,10),uid=()=>Math.random().toString(36).slice(2,10),rs=n=>'Rs '+Number(n||0).toLocaleString('en-PK');
+let db=JSON.parse(localStorage.getItem('dentalos')||'{"patients":[]}');
+const save=()=>localStorage.setItem('dentalos',JSON.stringify(db));
+const S={user:sessionStorage.getItem('role'),view:'list',pid:null,sel:[],q:'',due:false};
+const cur=()=>db.patients.find(x=>x.id===S.pid);
+/* image store (IndexedDB) */
+const idb=new Promise(r=>{const q=indexedDB.open('dentalos-img',1);q.onupgradeneeded=()=>q.result.createObjectStore('i');q.onsuccess=()=>r(q.result)});
+const tx=async(m,f)=>{const d=await idb;return new Promise(r=>{const t=d.transaction('i',m),s=f(t.objectStore('i'));t.oncomplete=()=>r(s.result)})};
+const imgPut=(k,v)=>tx('readwrite',s=>s.put(v,k)),imgGet=k=>tx('readonly',s=>s.get(k)),imgDel=k=>tx('readwrite',s=>s.delete(k));
+const shrink=f=>new Promise(res=>{const r=new FileReader();r.onload=()=>{const i=new Image();i.onload=()=>{const k=Math.min(1,1400/Math.max(i.width,i.height)),c=document.createElement('canvas');c.width=i.width*k;c.height=i.height*k;c.getContext('2d').drawImage(i,0,0,c.width,c.height);res(c.toDataURL('image/jpeg',.8))};i.src=r.result};r.readAsDataURL(f)});
+/* helpers */
+const money=p=>{const t=p.treatments.reduce((a,x)=>a+ +x.fee,0),pd=p.payments.reduce((a,x)=>a+ +x.amount,0);return{t,pd,b:t-pd}};
+const tstat=(p,t)=>{let s='';p.treatments.forEach(x=>{if(x.teeth.includes(t))s=x.status==='done'?'done':(s||'plan')});return s};
+const isDue=p=>p.followUp&&p.followUp.date&&p.followUp.date<=today();
+const go=(v,id)=>{S.view=v;if(id!==undefined)S.pid=id;S.sel=[];render();scrollTo(0,0)};
+/* login */
+function login(){const r=$('#role').value;if($('#pin').value===PINS[r]){S.user=r;sessionStorage.setItem('role',r);render()}else alert('Wrong PIN')}
+function logout(){S.user=null;sessionStorage.removeItem('role');render()}
+/* views */
+function render(){const a=$('#app');
+ if(!S.user){a.innerHTML=`<div class="login card"><h2>Dental OS Care</h2><select id="role"><option value="receptionist">Receptionist</option><option value="dentist">Dentist</option></select><input id="pin" type="password" placeholder="PIN" onkeydown="if(event.key==='Enter')login()"><button onclick="login()">Log in</button></div>`;return}
+ a.innerHTML=`<div class="bar"><b>Dental OS Care</b><span>${S.user}</span><button onclick="backup()">Backup</button><label><button onclick="this.nextElementSibling.click()">Restore</button><input type="file" accept=".json" hidden onchange="restore(this.files[0])"></label><button onclick="logout()">Log out</button></div>`+
+ (S.view==='list'?listView():S.view==='form'?formView():patientView());
+ if(S.view==='patient')document.querySelectorAll('img[data-id]').forEach(async e=>e.src=await imgGet(e.dataset.id)||'');
+ if(S.view==='list')rows()}
+function listView(){return `<div class="wrap"><div class="row"><input type="search" id="q" placeholder="Search name or phone" value="${h(S.q)}" oninput="S.q=this.value;rows()"><button onclick="S.due=!S.due;render()">${S.due?'Show all':'Follow-ups due'}</button><button onclick="S.pid=null;go('form')">+ New patient</button></div><div class="card"><table><thead><tr><th>Patient</th><th>Phone</th><th>Balance</th><th>Next follow-up</th></tr></thead><tbody id="rows"></tbody></table></div></div>`}
+function rows(){const q=S.q.toLowerCase(),l=db.patients.filter(p=>(p.name+p.phone).toLowerCase().includes(q)&&(!S.due||isDue(p)));
+ $('#rows').innerHTML=l.map(p=>`<tr class="pt" onclick="go('patient','${p.id}')"><td>${h(p.name)}</td><td>${h(p.phone)}</td><td>${rs(money(p).b)}</td><td>${p.followUp&&p.followUp.date?`<span class="${isDue(p)?'tag due':''}">${h(p.followUp.date)}</span>`:'-'}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">No patients yet. Add the first one.</td></tr>'}
+function formView(){const p=cur()||{};const f=(id,l,t='text')=>`<label>${l}<input id="${id}" type="${t}" value="${h(p[id])}"></label>`;
+ return `<div class="wrap"><button class="ghost" onclick="go('${p.id?'patient':'list'}')">← Back</button><div class="card"><h3>${p.id?'Edit patient':'New patient'}</h3><div class="grid">${f('name','Full name')}${f('phone','Phone number','tel')}${f('age','Age','number')}<label>Gender<select id="gender">${['Male','Female','Other'].map(g=>`<option ${p.gender===g?'selected':''}>${g}</option>`).join('')}</select></label></div><div class="grid" style="margin-top:10px">${f('address','Address')}${f('history','Allergies / medical history')}</div><div class="row"><button onclick="saveP()">Save patient</button></div></div></div>`}
+function saveP(){const v=k=>$('#'+k).value.trim();if(!v('name')||!v('phone'))return alert('Name and phone are required');
+ let p=cur();if(!p){p={id:uid(),treatments:[],payments:[],images:[],followUp:{}};db.patients.push(p);S.pid=p.id}
+ Object.assign(p,{name:v('name'),phone:v('phone'),age:v('age'),gender:$('#gender').value,address:v('address'),history:v('history')});save();go('patient')}
+function editP(){go('form')}
+function delP(){const p=cur();if(!confirm('Delete '+p.name+' and all records?'))return;p.images.forEach(i=>imgDel(i.id));db.patients=db.patients.filter(x=>x!==p);save();go('list')}
+function chart(p){const b=n=>`<button class="tooth t${n%10} ${tstat(p,n)} ${S.sel.includes(n)?'sel':''}" data-t="${n}" onclick="tt(${n})" title="Tooth ${n}">${n}</button>`;
+ return `<div class="chart"><div class="arch">${UP.map(b).join('')}</div><div class="mid"></div><div class="arch low">${LO.map(b).join('')}</div></div>`}
+function patientView(){const p=cur(),m=money(p),dn=S.user==='dentist',f=p.followUp||{};
+ const opts=Object.entries(PROCS).map(([g,l])=>`<optgroup label="${g}">${l.map(([n,x])=>`<option data-fee="${x}">${h(n)}</option>`).join('')}</optgroup>`).join('');
+ return `<div class="wrap"><button class="ghost" onclick="go('list')">← Patients</button>
+<div class="head"><div><h2>${h(p.name)}</h2><p class="muted">${h(p.phone)}, ${h(p.address)}, ${h(p.age)} yrs, ${h(p.gender)}</p>${p.history?`<p class="warn">Medical: ${h(p.history)}</p>`:''}</div><div class="row"><button onclick="editP()">Edit</button><button class="danger" onclick="delP()">Delete</button></div></div>
+<div class="stats"><div><small>Total treatment</small><b>${rs(m.t)}</b></div><div><small>Paid</small><b>${rs(m.pd)}</b></div><div class="bal"><small>Remaining</small><b>${rs(m.b)}</b></div><div><small>Next follow-up</small><b>${h(f.date||'Not set')}</b></div></div>
+<div class="card"><h3>Teeth chart (tap to select)</h3><p class="muted">Green = done, yellow = planned, teal = selected.</p>${chart(p)}<div class="row"><button onclick="full()">Full mouth / general</button><button onclick="S.sel=[];render()">Clear</button><span id="selTxt">Selected: ${S.sel.join(', ')||'none'}</span></div>
+${dn?`<div class="grid"><label>Procedure<select id="proc" onchange="pc()"><option value="">Select…</option>${opts}<option data-fee="0">Other (write in notes)</option></select></label><label>Fee (Rs)<input id="fee" type="number" value="0"></label><label>Status<select id="st"><option value="planned">Planned</option><option value="done">Done</option></select></label><label>Notes<input id="tn"></label></div><div class="row"><button onclick="addTx()">Add procedure</button></div>`:'<p class="muted">Only the dentist can add procedures.</p>'}</div>
+<div class="card"><h3>Procedures</h3><table>${p.treatments.map(x=>`<tr><td>${h(x.date)}</td><td>${h(x.teeth.join(', '))}</td><td>${h(x.proc)}<br><small class="muted">${h(x.notes)}</small></td><td>${rs(x.fee)}</td><td>${dn?`<button class="tag ${x.status==='done'?'done':''}" onclick="flip('${x.id}')">${x.status}</button> <button class="danger" onclick="del('treatments','${x.id}')">x</button>`:`<span class="tag ${x.status==='done'?'done':''}">${x.status}</span>`}</td></tr>`).join('')||'<tr><td class="muted">No procedures yet.</td></tr>'}</table></div>
+<div class="card"><h3>Payments</h3><div class="row"><input id="pa" type="number" placeholder="Amount received"><input id="pn" placeholder="Note (cash / easypaisa)"><button onclick="addPay()">Add payment</button></div><table>${p.payments.map(x=>`<tr><td>${h(x.date)}</td><td>${rs(x.amount)}</td><td>${h(x.note)}</td><td>${h(x.by)}</td><td><button class="danger" onclick="del('payments','${x.id}')">x</button></td></tr>`).join('')}</table></div>
+<div class="card"><h3>Next follow-up</h3><div class="row"><input id="fd" type="date" value="${h(f.date)}"><input id="fn" placeholder="Reason / next procedure" value="${h(f.note)}" style="flex:1"><button onclick="saveF()">Save</button></div></div>
+<div class="card"><h3>Photos and X-rays</h3><div class="row"><select id="ic"><option>Mouth photo</option><option>X-ray</option><option>Other</option></select><input id="inote" placeholder="Note"><input id="ifile" type="file" accept="image/*" multiple><button onclick="upImg()">Upload${S.sel.length?' (tag teeth '+S.sel.join(',')+')':''}</button></div><div class="imgs">${p.images.map(i=>`<figure><img data-id="${i.id}" alt="${h(i.cat)}" onclick="view('${i.id}')"><b>${h(i.cat)}</b> ${h(i.date)}<br>${i.teeth.length?'Teeth: '+h(i.teeth.join(', '))+'<br>':''}${h(i.note)}<br><button class="danger" onclick="delImg('${i.id}')">Delete</button></figure>`).join('')}</div></div></div>`}
+/* actions */
+function tt(n){const i=S.sel.indexOf(n);i<0?S.sel.push(n):S.sel.splice(i,1);document.querySelector(`[data-t="${n}"]`).classList.toggle('sel');$('#selTxt').textContent='Selected: '+(S.sel.join(', ')||'none');pc()}
+function full(){S.sel=['Full mouth'];render()}
+function pc(){const o=$('#proc');if(!o||!o.selectedOptions[0])return;const n=S.sel.filter(t=>t!=='Full mouth').length||1;$('#fee').value=(+o.selectedOptions[0].dataset.fee||0)*n}
+function addTx(){const p=cur();if(!S.sel.length)return alert('Select tooth or Full mouth first');const pr=$('#proc').value;if(!pr)return alert('Select a procedure');
+ p.treatments.push({id:uid(),date:today(),teeth:[...S.sel],proc:pr,fee:+$('#fee').value||0,status:$('#st').value,notes:$('#tn').value,by:S.user});save();S.sel=[];render()}
+function flip(id){const x=cur().treatments.find(t=>t.id===id);x.status=x.status==='done'?'planned':'done';save();render()}
+function del(k,id){if(!confirm('Delete this entry?'))return;const p=cur();p[k]=p[k].filter(x=>x.id!==id);save();render()}
+function addPay(){const a=+$('#pa').value;if(!a)return alert('Enter amount');cur().payments.push({id:uid(),date:today(),amount:a,note:$('#pn').value,by:S.user});save();render()}
+function saveF(){cur().followUp={date:$('#fd').value,note:$('#fn').value};save();render()}
+async function upImg(){const fs=[...$('#ifile').files];if(!fs.length)return alert('Choose image(s)');const p=cur();
+ for(const f of fs){const id=uid();await imgPut(id,await shrink(f));p.images.push({id,cat:$('#ic').value,note:$('#inote').value,date:today(),teeth:[...S.sel],by:S.user})}
+ save();render()}
+async function delImg(id){if(!confirm('Delete image?'))return;const p=cur();p.images=p.images.filter(i=>i.id!==id);await imgDel(id);save();render()}
+async function view(id){const o=document.createElement('div');o.className='ov';o.onclick=()=>o.remove();o.innerHTML=`<img src="${await imgGet(id)}" alt="">`;document.body.append(o)}
+async function backup(){const img={};for(const p of db.patients)for(const i of p.images)img[i.id]=await imgGet(i.id);
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({db,img})],{type:'application/json'}));a.download='dental-os-backup-'+today()+'.json';a.click()}
+async function restore(f){if(!f||!confirm('This replaces all current data. Continue?'))return;const d=JSON.parse(await f.text());db=d.db;for(const k in d.img)await imgPut(k,d.img[k]);save();go('list')}
+render();
